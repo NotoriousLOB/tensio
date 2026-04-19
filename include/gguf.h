@@ -66,6 +66,7 @@ typedef enum {
     GGUF_TYPE_I32  = 18,
     GGUF_TYPE_I64  = 19,
     GGUF_TYPE_F64  = 20,
+    GGUF_TYPE_BF16 = 30,
 } gguf_type_t;
 
 /* ================================================================
@@ -127,6 +128,7 @@ typedef struct {
     gguf_kv_t     *metadata;
     gguf_tensor_t *tensors;
     uint8_t       *data;        /* start of tensor data section (64-byte aligned) */
+    uint8_t       *kv_end;      /* pointer to first byte after the KV section (= tensor info start) */
 } gguf_file_t;
 
 /* ================================================================
@@ -192,6 +194,7 @@ static void gguf_tensor_type_info(gguf_type_t type,
         case GGUF_TYPE_I32:  *block_size = 1;   *type_size = 4;   break;
         case GGUF_TYPE_I64:  *block_size = 1;   *type_size = 8;   break;
         case GGUF_TYPE_F64:  *block_size = 1;   *type_size = 8;   break;
+        case GGUF_TYPE_BF16: *block_size = 1;   *type_size = 2;   break;
         default:             *block_size = 1;   *type_size = 0;   break;
     }
 }
@@ -355,6 +358,7 @@ int gguf_parse(const gguf_mmap_t *mmap, gguf_file_t *out) {
     } else {
         out->metadata = NULL;
     }
+    out->kv_end = (uint8_t *)p; /* points to first byte of tensor info section */
 
     /* Tensor info section */
     if (out->tensor_count > SIZE_MAX / sizeof(gguf_tensor_t))

@@ -56,6 +56,13 @@ int convert_tq_to_gguf(const char *tq_path, const char *gguf_path);
 #if defined(CONVERT_IMPLEMENTATION) && !defined(CONVERT_IMPLEMENTATION_DONE)
 #define CONVERT_IMPLEMENTATION_DONE
 
+static inline float bf16_to_f32(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 static int detect_format(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -80,6 +87,7 @@ static gguf_type_t st_dtype_to_gguf(st_dtype_t dt) {
     switch (dt) {
         case ST_F32:  return GGUF_TYPE_F32;
         case ST_F16:  return GGUF_TYPE_F16;
+        case ST_BF16: return GGUF_TYPE_BF16;
         case ST_F64:  return GGUF_TYPE_F64;
         case ST_I8:   return GGUF_TYPE_I8;
         case ST_I16:  return GGUF_TYPE_I16;
@@ -93,12 +101,15 @@ static st_dtype_t gguf_type_to_st(gguf_type_t gt) {
     switch (gt) {
         case GGUF_TYPE_F32:  return ST_F32;
         case GGUF_TYPE_F16:  return ST_F16;
+        case GGUF_TYPE_BF16: return ST_BF16;
         case GGUF_TYPE_F64:  return ST_F64;
         case GGUF_TYPE_I8:   return ST_I8;
         case GGUF_TYPE_I16:  return ST_I16;
         case GGUF_TYPE_I32:  return ST_I32;
         case GGUF_TYPE_I64:  return ST_I64;
-        default:             return ST_F32; /* quantized → treated as F32 blob */
+        default:             return ST_F32; /* GGUF quantized types (Q4_0, Q4_K, etc.)
+                                             * have no ST equivalent — callers must
+                                             * dequantize first or use passthrough. */
     }
 }
 
@@ -142,19 +153,28 @@ int convert_safetensors_to_gguf(const char *st_path, const char *gguf_path) {
         if (gt->name) strcpy(gt->name, st->name);
 
         gt->type = st_dtype_to_gguf(st->dtype);
-        gt->n_dims = st->ndim;
-        if (gt->n_dims > 4) gt->n_dims = 4;
         memset(gt->ne, 0, sizeof(gt->ne));
-        for (d = 0; d < gt->n_dims; ++d)
-            gt->ne[d] = st->shape[d];
+        if (st->ndim <= 4) {
+            gt->n_dims = st->ndim;
+            for (d = 0; d < st->ndim; ++d)
+                gt->ne[d] = st->shape[d];
+        } else {
+            /* GGUF v3 supports max 4 dims — flatten to 1D */
+            uint64_t total = 1;
+            for (d = 0; d < st->ndim; ++d) total *= st->shape[d];
+            gt->n_dims = 1;
+            gt->ne[0] = total;
+        }
 
+        /* GGUF spec: tensor offsets relative to data section must be 32-byte aligned */
+        data_offset = (data_offset + 31) & ~(uint64_t)31;
         gt->offset = data_offset;
         gt->size = st->size;
         data_offset += st->size;
     }
 
-    /* Build contiguous data buffer */
-    data_buf = (uint8_t *)malloc((size_t)data_offset);
+    /* Build contiguous data buffer (size includes alignment padding) */
+    data_buf = (uint8_t *)calloc(1, (size_t)data_offset);
     if (!data_buf && data_offset > 0) {
         for (i = 0; i < src.num_tensors; ++i) free(dst.tensors[i].name);
         free(dst.tensors);
@@ -225,19 +245,19 @@ int convert_safetensors_to_tq_opts(const char *st_path, const char *tq_path,
     st_file_t src;
     tq_header_t hdr;
     tq_tensor_t *descs = NULL;
-    FILE *fp;
+    FILE *fp = NULL;
     uint32_t i;
+    int rc = -1;
     int lz4 = convert_opts_lz4(opts);
-    long pos, aligned;
-
-    /* Per-tensor buffers for two-pass LZ4 approach */
-    uint8_t **bufs = NULL;     /* uncompressed packed data per tensor */
-    uint8_t **comp_bufs = NULL; /* compressed data (only if lz4) */
-    size_t *comp_sizes = NULL;
-    uint32_t bits = convert_opts_bits(opts);  /* bits per weight (2-8, default 4) */
+    long desc_start, aligned;
+    uint64_t data_offset = 0;
+    uint32_t bits = convert_opts_bits(opts);
 
     if (st_mmap(st_path, &sm) != 0) return -1;
     if (st_parse(&sm, &src) != 0) { st_munmap(&sm); return -1; }
+
+    descs = (tq_tensor_t *)calloc(src.num_tensors, sizeof(tq_tensor_t));
+    if (!descs && src.num_tensors > 0) goto done;
 
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = TQ_MAGIC;
@@ -246,141 +266,126 @@ int convert_safetensors_to_tq_opts(const char *st_path, const char *tq_path,
     hdr.model_family_id = TQ_FAMILY_UNKNOWN;
     if (lz4) hdr.features |= TQ_FEATURE_LZ4_PER_TENSOR;
 
-    descs = (tq_tensor_t *)calloc(src.num_tensors, sizeof(tq_tensor_t));
-    if (!descs && src.num_tensors > 0) { st_free(&src); st_munmap(&sm); return -1; }
+    /* Compute data section start: header + all descriptors, 64-byte aligned */
+    desc_start = (long)(sizeof(tq_header_t) + (size_t)src.num_tensors * sizeof(tq_tensor_t));
+    aligned = (desc_start + 63) & ~63L;
+    hdr.data_offset = (uint64_t)aligned;
 
-    bufs = (uint8_t **)calloc(src.num_tensors, sizeof(uint8_t *));
-    if (lz4) {
-        comp_bufs = (uint8_t **)calloc(src.num_tensors, sizeof(uint8_t *));
-        comp_sizes = (size_t *)calloc(src.num_tensors, sizeof(size_t));
+    fp = fopen(tq_path, "wb");
+    if (!fp) goto done;
+
+    /* Write placeholder header and descriptors; we'll seek back to fix them */
+    fwrite(&hdr, sizeof(hdr), 1, fp);
+    fwrite(descs, sizeof(tq_tensor_t), src.num_tensors, fp);
+    {
+        long pos = ftell(fp);
+        while (pos < aligned) { uint8_t z = 0; fwrite(&z, 1, 1, fp); pos++; }
     }
 
-    /* Pass 1: quantize each tensor and optionally LZ4-compress */
+    /* Streaming pass: quantize one tensor at a time, write, free immediately */
     for (i = 0; i < src.num_tensors; ++i) {
         const st_tensor_t *st = &src.tensors[i];
         tq_tensor_t *td = &descs[i];
         uint64_t n_elements;
+        uint8_t *buf = NULL;
+        uint32_t d;
 
         strncpy(td->name, st->name, sizeof(td->name) - 1);
-        td->rows = (st->ndim >= 1) ? (uint32_t)st->shape[0] : 1;
-        td->cols = (st->ndim >= 2) ? (uint32_t)st->shape[1] : 1;
+        n_elements = 1;
+        for (d = 0; d < st->ndim; ++d) n_elements *= st->shape[d];
+        td->rows = (uint32_t)n_elements;
+        td->cols = 1;
+        td->frame_offset = data_offset;
 
-        n_elements = (uint64_t)td->rows * td->cols;
+        if (st->dtype == ST_F32 || st->dtype == ST_BF16) {
+            float *tmp = NULL;
+            const float *fdata;
 
-        if (st->dtype == ST_F32) {
+            if (st->dtype == ST_BF16) {
+                const uint16_t *src16 =
+                    (const uint16_t *)st_get_tensor_data(&src, st);
+                tmp = (float *)malloc(n_elements * sizeof(float));
+                if (tmp) {
+                    uint64_t j;
+                    for (j = 0; j < n_elements; ++j)
+                        tmp[j] = bf16_to_f32(src16[j]);
+                }
+                fdata = tmp;
+            } else {
+                fdata = (const float *)st_get_tensor_data(&src, st);
+            }
+
+            if (fdata) {
 #if defined(__ARM_NEON) && defined(TQ_WITH_NEON)
-            /* Use PolarQuant with configurable bits and NEON FWHT */
-            bufs[i] = (uint8_t *)malloc(tq_packed_size(n_elements, bits));
-            if (bufs[i]) {
-                const float *fdata = (const float *)st_get_tensor_data(&src, st);
-                quantize_f32_to_polar(fdata, bufs[i], n_elements, td, bits);
-            }
+                buf = (uint8_t *)malloc(tq_packed_size(n_elements, bits));
+                if (buf) quantize_f32_to_polar(fdata, buf, n_elements, td, bits);
 #else
-            /* Fallback to ternary 2-bit */
-            td->b = 2;
-            td->unpacked_size = (n_elements + 3) / 4;
-            bufs[i] = (uint8_t *)calloc(1, (size_t)td->unpacked_size);
-            if (bufs[i]) {
-                const float *fdata = (const float *)st_get_tensor_data(&src, st);
-                quantize_f32_to_ternary(fdata, bufs[i], n_elements);
-            }
+                td->b = 2;
+                td->unpacked_size = (n_elements + 3) / 4;
+                buf = (uint8_t *)calloc(1, (size_t)td->unpacked_size);
+                if (buf) quantize_f32_to_ternary(fdata, buf, n_elements);
 #endif
+            }
+            free(tmp);
         } else {
-            /* Non-F32: passthrough as raw bytes */
             td->b = 0;
             td->tensor_flags = TQ_TFLAG_SET_ORIG_TYPE(0, (uint32_t)st->dtype);
             td->unpacked_size = st->size;
-            bufs[i] = (uint8_t *)malloc((size_t)st->size);
-            if (bufs[i]) {
-                const void *raw = st_get_tensor_data(&src, st);
-                memcpy(bufs[i], raw, (size_t)st->size);
-            }
+            buf = (uint8_t *)malloc((size_t)st->size);
+            if (buf) memcpy(buf, st_get_tensor_data(&src, st), (size_t)st->size);
         }
 
+        if (!buf) goto done;
+
 #ifdef TQ_WITH_LZ4
-        if (lz4 && bufs[i] && td->unpacked_size > 0) {
-            /* Use LZ4 Frame API for compression */
+        if (lz4 && td->unpacked_size > 0) {
             LZ4F_preferences_t prefs;
-            size_t bound;
-            size_t csize;
+            size_t bound, csize;
+            uint8_t *cbuf;
 
             memset(&prefs, 0, sizeof(prefs));
             prefs.frameInfo.contentSize = td->unpacked_size;
-
             bound = LZ4F_compressFrameBound(td->unpacked_size, &prefs);
-            comp_bufs[i] = (uint8_t *)malloc(bound);
-            if (comp_bufs[i]) {
-                csize = LZ4F_compressFrame(comp_bufs[i], bound,
-                                           bufs[i], td->unpacked_size,
-                                           &prefs);
+            cbuf = (uint8_t *)malloc(bound);
+            if (cbuf) {
+                csize = LZ4F_compressFrame(cbuf, bound, buf, td->unpacked_size, &prefs);
                 if (!LZ4F_isError(csize) && csize < td->unpacked_size) {
-                    /* Compression helped */
-                    comp_sizes[i] = csize;
+                    td->frame_size = csize;
+                    fwrite(cbuf, 1, csize, fp);
+                    data_offset += csize;
+                    free(cbuf);
+                    free(buf);
+                    buf = NULL;
                 } else {
-                    /* Incompressible or error — store uncompressed */
-                    free(comp_bufs[i]);
-                    comp_bufs[i] = NULL;
-                    comp_sizes[i] = 0;
+                    free(cbuf);
+                    /* fall through to uncompressed write below */
                 }
             }
         }
 #endif
-    }
-
-    /* Pass 2: compute data offsets (using compressed sizes where available) */
-    {
-        uint64_t data_offset = 0;
-        for (i = 0; i < src.num_tensors; ++i) {
-            tq_tensor_t *td = &descs[i];
-            td->frame_offset = data_offset;
-            if (lz4 && comp_bufs && comp_bufs[i]) {
-                td->frame_size = comp_sizes[i];
-                data_offset += comp_sizes[i];
-            } else {
-                td->frame_size = 0;
-                data_offset += td->unpacked_size;
-            }
+        if (buf) {
+            td->frame_size = 0;
+            fwrite(buf, 1, (size_t)td->unpacked_size, fp);
+            data_offset += td->unpacked_size;
+            free(buf);
         }
-        hdr.total_data_size = data_offset;
     }
 
-    pos = (long)(sizeof(tq_header_t) + (size_t)src.num_tensors * sizeof(tq_tensor_t));
-    aligned = (pos + 63) & ~63L;
-    hdr.data_offset = (uint64_t)aligned;
+    hdr.total_data_size = data_offset;
 
-    fp = fopen(tq_path, "wb");
-    if (!fp) goto cleanup;
-
+    /* Seek back and rewrite header + descriptors with final offsets */
+    if (fseek(fp, 0, SEEK_SET) != 0) goto done;
     fwrite(&hdr, sizeof(hdr), 1, fp);
     fwrite(descs, sizeof(tq_tensor_t), src.num_tensors, fp);
+    rc = 0;
 
-    pos = ftell(fp);
-    while (pos < aligned) { uint8_t z = 0; fwrite(&z, 1, 1, fp); pos++; }
-
-    /* Write tensor data (compressed or uncompressed) */
-    for (i = 0; i < src.num_tensors; ++i) {
-        if (lz4 && comp_bufs && comp_bufs[i]) {
-            fwrite(comp_bufs[i], 1, comp_sizes[i], fp);
-        } else if (bufs[i]) {
-            fwrite(bufs[i], 1, (size_t)descs[i].unpacked_size, fp);
-        }
-    }
-
-    fclose(fp);
-    fp = NULL;
-
-cleanup:
-    for (i = 0; i < src.num_tensors; ++i) {
-        free(bufs[i]);
-        if (comp_bufs) free(comp_bufs[i]);
-    }
-    free(bufs);
-    free(comp_bufs);
-    free(comp_sizes);
+done:
+    if (fp) fclose(fp);
+    if (rc != 0 && tq_path) remove(tq_path);
     free(descs);
     st_free(&src);
     st_munmap(&sm);
-    return fp ? -1 : 0; /* fp is NULL on success (closed above) */
+    return rc;
 }
 
 int convert_safetensors_to_tq(const char *st_path, const char *tq_path) {
@@ -473,16 +478,17 @@ int convert_gguf_to_tq_opts(const char *gguf_path, const char *tq_path,
     tq_tensor_t *descs = NULL;
     FILE *fp = NULL;
     uint64_t i;
+    int rc = -1;
     int lz4 = convert_opts_lz4(opts);
-    long pos, aligned;
-
-    uint8_t **bufs = NULL;
-    uint8_t **comp_bufs = NULL;
-    size_t *comp_sizes = NULL;
-    uint32_t bits = convert_opts_bits(opts);  /* bits per weight (2-8, default 4) */
+    long desc_start, aligned;
+    uint64_t data_offset = 0;
+    uint32_t bits = convert_opts_bits(opts);
 
     if (gguf_mmap(gguf_path, &gm) != 0) return -1;
     if (gguf_parse(&gm, &src) != 0) { gguf_munmap(&gm); return -1; }
+
+    descs = (tq_tensor_t *)calloc((size_t)src.tensor_count, sizeof(tq_tensor_t));
+    if (!descs && src.tensor_count > 0) goto done;
 
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = TQ_MAGIC;
@@ -491,139 +497,122 @@ int convert_gguf_to_tq_opts(const char *gguf_path, const char *tq_path,
     hdr.model_family_id = TQ_FAMILY_UNKNOWN;
     if (lz4) hdr.features |= TQ_FEATURE_LZ4_PER_TENSOR;
 
-    descs = (tq_tensor_t *)calloc((size_t)src.tensor_count, sizeof(tq_tensor_t));
-    if (!descs && src.tensor_count > 0) {
-        gguf_free(&src); gguf_munmap(&gm); return -1;
+    desc_start = (long)(sizeof(tq_header_t) + (size_t)src.tensor_count * sizeof(tq_tensor_t));
+    aligned = (desc_start + 63) & ~63L;
+    hdr.data_offset = (uint64_t)aligned;
+
+    fp = fopen(tq_path, "wb");
+    if (!fp) goto done;
+
+    fwrite(&hdr, sizeof(hdr), 1, fp);
+    fwrite(descs, sizeof(tq_tensor_t), (size_t)src.tensor_count, fp);
+    {
+        long pos = ftell(fp);
+        while (pos < aligned) { uint8_t z = 0; fwrite(&z, 1, 1, fp); pos++; }
     }
 
-    bufs = (uint8_t **)calloc((size_t)src.tensor_count, sizeof(uint8_t *));
-    if (lz4) {
-        comp_bufs = (uint8_t **)calloc((size_t)src.tensor_count, sizeof(uint8_t *));
-        comp_sizes = (size_t *)calloc((size_t)src.tensor_count, sizeof(size_t));
-    }
-
-    /* Pass 1: build descriptors, quantize/copy data, optionally compress */
     for (i = 0; i < src.tensor_count; ++i) {
         const gguf_tensor_t *gt = &src.tensors[i];
         tq_tensor_t *td = &descs[i];
+        uint64_t n_elements;
+        uint8_t *buf = NULL;
+        uint32_t d;
 
         strncpy(td->name, gt->name, sizeof(td->name) - 1);
-        td->rows = (gt->n_dims >= 1) ? (uint32_t)gt->ne[0] : 1;
-        td->cols = (gt->n_dims >= 2) ? (uint32_t)gt->ne[1] : 1;
+        n_elements = 1;
+        for (d = 0; d < gt->n_dims; ++d) n_elements *= gt->ne[d];
+        td->rows = (uint32_t)n_elements;
+        td->cols = 1;
+        td->frame_offset = data_offset;
 
-        if (gt->type == GGUF_TYPE_F32) {
-            uint64_t n_elements = (uint64_t)td->rows * td->cols;
+        if (gt->type == GGUF_TYPE_F32 || gt->type == GGUF_TYPE_BF16) {
+            float *tmp = NULL;
+            const float *fdata;
+
+            if (gt->type == GGUF_TYPE_BF16) {
+                const uint16_t *src16 =
+                    (const uint16_t *)gguf_get_tensor_data(&src, gt);
+                tmp = (float *)malloc(n_elements * sizeof(float));
+                if (tmp) {
+                    uint64_t j;
+                    for (j = 0; j < n_elements; ++j)
+                        tmp[j] = bf16_to_f32(src16[j]);
+                }
+                fdata = tmp;
+            } else {
+                fdata = (const float *)gguf_get_tensor_data(&src, gt);
+            }
+
+            if (fdata) {
 #if defined(__ARM_NEON) && defined(TQ_WITH_NEON)
-            /* Use PolarQuant with configurable bits and NEON FWHT */
-            bufs[i] = (uint8_t *)malloc(tq_packed_size(n_elements, bits));
-            if (bufs[i]) {
-                const float *fdata = (const float *)gguf_get_tensor_data(&src, gt);
-                quantize_f32_to_polar(fdata, bufs[i], n_elements, td, bits);
-            }
+                buf = (uint8_t *)malloc(tq_packed_size(n_elements, bits));
+                if (buf) quantize_f32_to_polar(fdata, buf, n_elements, td, bits);
 #else
-            /* Fallback to ternary 2-bit */
-            td->b = 2;
-            td->tensor_flags = 0;
-            td->unpacked_size = (n_elements + 3) / 4;
-            bufs[i] = (uint8_t *)calloc(1, (size_t)td->unpacked_size);
-            if (bufs[i]) {
-                const float *fdata = (const float *)gguf_get_tensor_data(&src, gt);
-                quantize_f32_to_ternary(fdata, bufs[i], n_elements);
-            }
+                td->b = 2;
+                td->tensor_flags = 0;
+                td->unpacked_size = (n_elements + 3) / 4;
+                buf = (uint8_t *)calloc(1, (size_t)td->unpacked_size);
+                if (buf) quantize_f32_to_ternary(fdata, buf, n_elements);
 #endif
+            }
+            free(tmp);
         } else {
             td->b = 0;
             td->tensor_flags = TQ_TFLAG_SET_ORIG_TYPE(0, (uint32_t)gt->type);
             td->unpacked_size = gt->size;
-
-            bufs[i] = (uint8_t *)malloc((size_t)gt->size);
-            if (bufs[i]) {
-                const void *raw = gguf_get_tensor_data(&src, gt);
-                memcpy(bufs[i], raw, (size_t)gt->size);
-            }
+            buf = (uint8_t *)malloc((size_t)gt->size);
+            if (buf) memcpy(buf, gguf_get_tensor_data(&src, gt), (size_t)gt->size);
         }
 
+        if (!buf) goto done;
+
 #ifdef TQ_WITH_LZ4
-        if (lz4 && bufs[i] && td->unpacked_size > 0) {
-            /* Use LZ4 Frame API for compression */
+        if (lz4 && td->unpacked_size > 0) {
             LZ4F_preferences_t prefs;
-            size_t bound;
-            size_t csize;
+            size_t bound, csize;
+            uint8_t *cbuf;
 
             memset(&prefs, 0, sizeof(prefs));
             prefs.frameInfo.contentSize = td->unpacked_size;
-
             bound = LZ4F_compressFrameBound(td->unpacked_size, &prefs);
-            comp_bufs[i] = (uint8_t *)malloc(bound);
-            if (comp_bufs[i]) {
-                csize = LZ4F_compressFrame(comp_bufs[i], bound,
-                                           bufs[i], td->unpacked_size,
-                                           &prefs);
+            cbuf = (uint8_t *)malloc(bound);
+            if (cbuf) {
+                csize = LZ4F_compressFrame(cbuf, bound, buf, td->unpacked_size, &prefs);
                 if (!LZ4F_isError(csize) && csize < td->unpacked_size) {
-                    comp_sizes[i] = csize;
+                    td->frame_size = csize;
+                    fwrite(cbuf, 1, csize, fp);
+                    data_offset += csize;
+                    free(cbuf);
+                    free(buf);
+                    buf = NULL;
                 } else {
-                    free(comp_bufs[i]);
-                    comp_bufs[i] = NULL;
-                    comp_sizes[i] = 0;
+                    free(cbuf);
                 }
             }
         }
 #endif
-    }
-
-    /* Pass 2: compute offsets */
-    {
-        uint64_t data_offset = 0;
-        for (i = 0; i < src.tensor_count; ++i) {
-            tq_tensor_t *td = &descs[i];
-            td->frame_offset = data_offset;
-            if (lz4 && comp_bufs && comp_bufs[i]) {
-                td->frame_size = comp_sizes[i];
-                data_offset += comp_sizes[i];
-            } else {
-                td->frame_size = 0;
-                data_offset += td->unpacked_size;
-            }
+        if (buf) {
+            td->frame_size = 0;
+            fwrite(buf, 1, (size_t)td->unpacked_size, fp);
+            data_offset += td->unpacked_size;
+            free(buf);
         }
-        hdr.total_data_size = data_offset;
     }
 
-    pos = (long)(sizeof(tq_header_t) + (size_t)src.tensor_count * sizeof(tq_tensor_t));
-    aligned = (pos + 63) & ~63L;
-    hdr.data_offset = (uint64_t)aligned;
+    hdr.total_data_size = data_offset;
 
-    fp = fopen(tq_path, "wb");
-    if (!fp) goto cleanup;
-
+    if (fseek(fp, 0, SEEK_SET) != 0) goto done;
     fwrite(&hdr, sizeof(hdr), 1, fp);
     fwrite(descs, sizeof(tq_tensor_t), (size_t)src.tensor_count, fp);
+    rc = 0;
 
-    pos = ftell(fp);
-    while (pos < aligned) { uint8_t z = 0; fwrite(&z, 1, 1, fp); pos++; }
-
-    for (i = 0; i < src.tensor_count; ++i) {
-        if (lz4 && comp_bufs && comp_bufs[i]) {
-            fwrite(comp_bufs[i], 1, comp_sizes[i], fp);
-        } else if (bufs[i]) {
-            fwrite(bufs[i], 1, (size_t)descs[i].unpacked_size, fp);
-        }
-    }
-
-    fclose(fp);
-    fp = NULL;
-
-cleanup:
-    for (i = 0; i < src.tensor_count; ++i) {
-        free(bufs[i]);
-        if (comp_bufs) free(comp_bufs[i]);
-    }
-    free(bufs);
-    free(comp_bufs);
-    free(comp_sizes);
+done:
+    if (fp) fclose(fp);
+    if (rc != 0 && tq_path) remove(tq_path);
     free(descs);
     gguf_free(&src);
     gguf_munmap(&gm);
-    return fp ? -1 : 0;
+    return rc;
 }
 
 int convert_gguf_to_tq(const char *gguf_path, const char *tq_path) {
@@ -755,17 +744,18 @@ int convert_tq_to_gguf(const char *tq_path, const char *gguf_path) {
             gt->type = (gguf_type_t)TQ_TFLAG_GET_ORIG_TYPE(tt->tensor_flags);
             gt->size = tt->unpacked_size;
         } else {
-            /* Ternary → dequantize to F32 */
+            /* PolarQuant → dequantize to BF16 (half the size of F32, no extra fidelity loss) */
             uint64_t n_elements = (uint64_t)tt->rows * tt->cols;
-            gt->type = GGUF_TYPE_F32;
-            gt->size = n_elements * 4;
+            gt->type = GGUF_TYPE_BF16;
+            gt->size = n_elements * 2;
         }
 
+        total_data = (total_data + 31) & ~(uint64_t)31;
         gt->offset = total_data;
         total_data += gt->size;
     }
 
-    data_buf = (uint8_t *)malloc((size_t)total_data);
+    data_buf = (uint8_t *)calloc(1, (size_t)total_data);
     if (!data_buf && total_data > 0) {
         for (i = 0; i < src.hdr->tensor_count; ++i) free(dst.tensors[i].name);
         free(dst.tensors);
@@ -781,8 +771,20 @@ int convert_tq_to_gguf(const char *tq_path, const char *gguf_path) {
             const void *raw = tq_get_tensor_data(&src, tt);
             memcpy(data_buf + off, raw, (size_t)tt->unpacked_size);
         } else {
-            /* Dequantize ternary to F32 */
-            tq_dequant(&src, (uint32_t)i, (float *)(data_buf + off));
+            /* Dequantize to F32, then narrow to BF16 in-place */
+            uint64_t n_elements = (uint64_t)tt->rows * tt->cols;
+            float *tmp = (float *)malloc(n_elements * sizeof(float));
+            if (tmp) {
+                uint16_t *dst16 = (uint16_t *)(data_buf + off);
+                uint64_t j;
+                tq_dequant(&src, (uint32_t)i, tmp);
+                for (j = 0; j < n_elements; ++j) {
+                    uint32_t bits;
+                    memcpy(&bits, &tmp[j], sizeof(bits));
+                    dst16[j] = (uint16_t)(bits >> 16);
+                }
+                free(tmp);
+            }
         }
     }
     dst.data = data_buf;

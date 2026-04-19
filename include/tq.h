@@ -459,15 +459,27 @@ static void quantize_f32_to_polar(const float *restrict src, uint8_t *restrict d
 
         tq_fwht_neon(block);
 
-        /* Scalar quantization to centroids */
-        /* Pack 'values_per_byte' values into each byte */
+        /* Binary-search quantization: centroids are sorted ascending.
+         * Find the nearest centroid in O(log2(n_centroids)) per value. */
         for (uint64_t k = 0; k < TQ_POLAR_BLOCK_SIZE && start + k < n_elements; ++k) {
             float v = block[k];
-            uint32_t best_idx = 0;
-            float min_dist = 1e9f;
-            for (uint32_t c = 0; c < n_centroids; ++c) {
-                float d = fabsf(v - centroids[c]);
-                if (d < min_dist) { min_dist = d; best_idx = c; }
+            uint32_t lo = 0, hi = n_centroids - 1, best_idx;
+
+            /* Lower-bound binary search */
+            while (lo < hi) {
+                uint32_t mid = (lo + hi) >> 1;
+                if (centroids[mid] < v) lo = mid + 1;
+                else hi = mid;
+            }
+            /* lo is the first index with centroids[lo] >= v */
+            if (lo == 0) {
+                best_idx = 0;
+            } else if (lo == n_centroids) {
+                best_idx = n_centroids - 1;
+            } else {
+                float dl = v - centroids[lo - 1];
+                float dr = centroids[lo] - v;
+                best_idx = (dl <= dr) ? lo - 1 : lo;
             }
 
             /* Pack index into destination byte */
